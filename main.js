@@ -1,16 +1,33 @@
 export default {
     async fetch(request, env, ctx) {
-        return await handleRequest(request, env, ctx)
+        // 用 D1 Sessions API 开启 Read Replication：每个请求开一个 session，
+        // 让读请求可被路由到就近只读副本，写请求自动转发主库。
+        const mcpReqId = request.headers.get('mcp-session-id')
+        const resumeBookmark = (mcpReqId && cachedMCPBookmark[mcpReqId])
+            ?? request.headers.get('x-d1-bookmark')
+            ?? 'first-unconstrained'
+        const session = env.database.withSession(resumeBookmark)
+
+        const response = await handleRequest(request, env, ctx, session)
+
+        // 把本次 session 的 bookmark 回传，便于同一客户端/MCP 会话续接，保证顺序一致性
+        const bookmark = session.getBookmark() ?? ''
+        response.headers.set('x-d1-bookmark', bookmark)
+        // 让同一 MCP 会话的后续请求从最新版本续接
+        const mcpResId = response.headers.get('mcp-session-id') || mcpReqId
+        if (mcpResId) cachedMCPBookmark[mcpResId] = bookmark
+
+        return response
     }
 }
 
-async function handleRequest(request, env, ctx) {
+async function handleRequest(request, env, ctx, session) {
     const allowNewDevice = env.ALLOW_NEW_DEVICE !== undefined ? (env.ALLOW_NEW_DEVICE === 'false' ? false : Boolean(env.ALLOW_NEW_DEVICE)) : true
     const allowQueryNums = env.ALLOW_QUERY_NUMS !== undefined ? (env.ALLOW_QUERY_NUMS === 'false' ? false : Boolean(env.ALLOW_QUERY_NUMS)) : true
     const rootPath = env.ROOT_PATH || '/'
     const basicAuth = env.BASIC_AUTH
 
-    const db = new Database(env)
+    const db = new Database(session)
     ctx.waitUntil(db.cleanupExpiredSessions())
 
     const { searchParams, pathname } = new URL(request.url)
@@ -924,11 +941,11 @@ class APNs {
 let cachedAuthToken = {}
 let cachedDeviceToken = {}
 let cachedMCPSession = {}
+// 服务端缓存 MCP 会话的 D1 bookmark，使同一 MCP 会话跨多次 HTTP 请求保持顺序一致性
+let cachedMCPBookmark = {}
 
 class Database {
-    constructor(env) {
-        const db = env.database
-
+    constructor(db) {
         db.exec('CREATE TABLE IF NOT EXISTS `devices` (`id` INTEGER PRIMARY KEY, `key` VARCHAR(255) NOT NULL, `token` VARCHAR(255) NOT NULL, UNIQUE (`key`))')
         db.exec('CREATE TABLE IF NOT EXISTS `authorization` (`id` INTEGER PRIMARY KEY, `token` VARCHAR(255) NOT NULL, `time` VARCHAR(255) NOT NULL)')
         db.exec('CREATE TABLE IF NOT EXISTS `sessions` (`id` VARCHAR(64) PRIMARY KEY, `device_key` VARCHAR(255), `initialized` INTEGER DEFAULT 0, `created_at` INTEGER NOT NULL, `last_seen` INTEGER NOT NULL)')
